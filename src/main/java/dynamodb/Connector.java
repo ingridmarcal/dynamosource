@@ -12,8 +12,8 @@ import java.util.Optional;
 public interface Connector {
 
 
-    ScanResponse scan(int segmentNum, List<String> columns, List<Filter> filters);
-    List<Map<String, AttributeValue>> query(int segmentNum, List<String> columns, List<Filter> filters);
+    ScanResponse scan(int segmentNum, List<String> columns, Filter[] filters);
+    List<Map<String, AttributeValue>> query(int segmentNum, List<String> columns, Filter[] filters);
     boolean isFilterPushdownEnabled();
     boolean nonEmpty();
     boolean isEmpty();

@@ -3,21 +3,18 @@ package dynamodb;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
 
-
 import java.io.Serializable;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import org.apache.spark.sql.sources.Filter;
-
 
 public class DynamoScanConnector extends DynamoConnector implements Serializable {
 
     private final boolean consistentRead;
     private final boolean filterPushdown;
-    private final Optional<String> region;
-    private final Optional<String> roleArn;
-    private final Optional<String> providerClassName;
+    private final String region;
+    private final String roleArn;
+    private final String providerClassName;
 
     private final KeySchema keySchema;
     private final double readLimit;
@@ -25,18 +22,18 @@ public class DynamoScanConnector extends DynamoConnector implements Serializable
     private final int totalSegments;
     private final String tableName;
 
-
-    public DynamoScanConnector(String tableName, int parallelism, Map<String, String> parameters){
+    public DynamoScanConnector(String tableName, int parallelism, Map<String, String> parameters) {
+        super(parameters);
         this.tableName = tableName;
         this.consistentRead = Boolean.parseBoolean(parameters.getOrDefault("stronglyconsistentreads", "false"));
         this.filterPushdown = Boolean.parseBoolean(parameters.getOrDefault("filterpushdown", "true"));
-        this.region = Optional.ofNullable(parameters.get("region"));
-        this.roleArn = Optional.ofNullable(parameters.get("rolearn"));
-        this.providerClassName = Optional.ofNullable(parameters.get("providerClassName"));
+        this.region = parameters.getOrDefault("region", "us-east-1");
+        this.roleArn = parameters.getOrDefault("rolearn", "");
+        this.providerClassName = parameters.getOrDefault("providerClassName", "");
 
         DynamoDbClient dynamoDbClient = getDynamoDB(region, roleArn, providerClassName);
 
-        // Use DescribeTableRequest instead of direct describeTable() call
+        // Use DescribeTableRequest
         DescribeTableRequest request = DescribeTableRequest.builder()
                 .tableName(tableName)
                 .build();
@@ -58,12 +55,10 @@ public class DynamoScanConnector extends DynamoConnector implements Serializable
                 ? Integer.parseInt(parameters.get("readpartitions"))
                 : Math.max(1, (int) (tableSize / maxPartitionBytes));
 
-        long readThroughput = Long.parseLong(parameters.getOrDefault("throughput",
-                Optional.ofNullable(tableDescription.table().provisionedThroughput().readCapacityUnits())
-                        .filter(cap -> cap > 0)  // Explicit unboxing
-                        .map(String::valueOf)
-                        .orElse("100")));
-
+        ProvisionedThroughputDescription provisionedThroughput = tableDescription.table().provisionedThroughput();
+        long readThroughput = provisionedThroughput != null && provisionedThroughput.readCapacityUnits() > 0
+                ? provisionedThroughput.readCapacityUnits()
+                : Long.parseLong(parameters.getOrDefault("throughput", "100"));
 
         double avgItemSize = (double) tableSize / itemCount;
         this.readLimit = readThroughput * targetCapacity / parallelism;
@@ -72,7 +67,7 @@ public class DynamoScanConnector extends DynamoConnector implements Serializable
     }
 
     @Override
-    public ScanResponse scan(int segmentNum, List<String> columns, List<Filter> filters) {
+    public ScanResponse scan(int segmentNum, List<String> columns, Filter[] filters) {
         DynamoDbClient dynamoDbClient = getDynamoDB(region, roleArn, providerClassName);
 
         // Build ScanRequest
@@ -80,54 +75,52 @@ public class DynamoScanConnector extends DynamoConnector implements Serializable
                 .tableName(tableName)
                 .segment(segmentNum)
                 .totalSegments(totalSegments)
-                .limit(itemLimit)  // Equivalent to withMaxPageSize()
+                .limit(itemLimit)
                 .returnConsumedCapacity(ReturnConsumedCapacity.TOTAL)
                 .consistentRead(consistentRead);
 
-        // Handle column projection (ProjectionExpression)
+        // Handle column projection
         if (!columns.isEmpty()) {
             scanRequestBuilder.projectionExpression(String.join(", ", columns));
         }
 
-        // Handle filter conditions (FilterExpression)
-        if (!filters.isEmpty() && filterPushdown) {
-            String filterExpression = FilterPushdown.apply(filters); // Corrected usage
+        // Handle filter conditions
+        if (filters != null && filterPushdown) {
+            String filterExpression = FilterPushdown.apply(filters);
             scanRequestBuilder.filterExpression(filterExpression);
         }
 
-        // Execute the scan
         return dynamoDbClient.scan(scanRequestBuilder.build());
     }
 
     @Override
-    public List<Map<String, AttributeValue>> query(int segmentNum, List<String> columns, List<Filter> filters) {
+    public List<Map<String, AttributeValue>> query(int segmentNum, List<String> columns, Filter[] filters) {
         return List.of();
     }
 
-
     @Override
     public KeySchema getKeySchema() {
-        return null;
+        return this.keySchema;
     }
 
     @Override
     public double getReadLimit() {
-        return 0;
+        return this.readLimit;
     }
 
     @Override
     public int getItemLimit() {
-        return 0;
+        return this.itemLimit;
     }
 
     @Override
     public int getTotalSegments() {
-        return 0;
+        return this.totalSegments;
     }
 
     @Override
     public boolean isFilterPushdownEnabled() {
-        return false;
+        return this.filterPushdown;
     }
 
     @Override
@@ -140,4 +133,3 @@ public class DynamoScanConnector extends DynamoConnector implements Serializable
         return true;
     }
 }
-

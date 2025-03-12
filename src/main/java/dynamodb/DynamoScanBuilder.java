@@ -14,7 +14,7 @@ public class DynamoScanBuilder implements ScanBuilder, SupportsPushDownRequiredC
 
     private final Connector connector;
     private StructType currentSchema;
-    private Filter[] acceptedFilters = new Filter[0];
+    private Filter[] acceptedFilters;
 
     public DynamoScanBuilder(Connector connector, StructType schema) {
         this.connector = connector;
@@ -30,7 +30,9 @@ public class DynamoScanBuilder implements ScanBuilder, SupportsPushDownRequiredC
     public void pruneColumns(StructType requiredSchema) {
         List<String> keyFields = new ArrayList<>();
         keyFields.add(connector.getKeySchema().getHashKeyName());
-        connector.getKeySchema().getRangeKeyName().ifPresent(keyFields::add);
+
+        Optional.ofNullable(connector.getKeySchema().getRangeKeyName())
+                .ifPresent(keyFields::add);
 
         // Ensure primary key fields are always included
         Set<String> requiredFieldNames = new HashSet<>(keyFields);

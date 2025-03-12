@@ -8,8 +8,8 @@ import java.util.stream.Collectors;
 
 public class FilterPushdown {
 
-    public static String apply(List<Filter> filters) {
-        return filters.stream()
+    public static String apply(Filter[] filters) {
+        return Arrays.stream(filters)  // Convert array to stream
                 .map(FilterPushdown::buildCondition)
                 .map(FilterPushdown::parenthesize)
                 .collect(Collectors.joining(" AND "));

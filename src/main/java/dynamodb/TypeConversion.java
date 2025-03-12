@@ -148,7 +148,7 @@ public class TypeConversion {
                             conversions.entrySet().stream()
                                     .map(entry -> entry.getValue().apply(map.get(entry.getKey())))
                                     .collect(Collectors.toList())
-                    ).toSeq() // ✅ Convert List<Object> to Seq<Object>
+                    ).toList() // ✅ Convert List<Object> to Seq<Object>
             );
         }
         return null;

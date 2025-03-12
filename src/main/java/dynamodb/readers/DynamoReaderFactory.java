@@ -2,13 +2,13 @@ package dynamodb.readers;
 
 import com.google.common.util.concurrent.RateLimiter;
 import dynamodb.Connector;
-import dynamodb.QueryPartition;
 import dynamodb.ScanPartition;
 import dynamodb.TypeConversion;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
+import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import scala.collection.JavaConverters;
@@ -32,10 +32,11 @@ public class DynamoReaderFactory implements PartitionReaderFactory {
 
     @Override
     public PartitionReader<InternalRow> createReader(InputPartition partition) {
+
         if (connector.isEmpty()) {
             return new EmptyReader();
         }else if (connector.isQuery()){
-            return new QueryPartitionReader((QueryPartition) partition);
+            return new QueryPartitionReader((ScanPartition) partition);
         } else {
             return new ScanPartitionReader((ScanPartition) partition);
         }
@@ -63,7 +64,7 @@ public class DynamoReaderFactory implements PartitionReaderFactory {
 
         private final int partitionIndex;
         private final List<String> requiredColumns;
-        private final List<org.apache.spark.sql.sources.Filter> filters;
+        private final Filter[] filters;
 
         private final Iterator<Map<String, AttributeValue>> pageIterator;
         private final RateLimiter rateLimiter;
@@ -78,7 +79,7 @@ public class DynamoReaderFactory implements PartitionReaderFactory {
         public ScanPartitionReader(ScanPartition scanPartition) {
             this.partitionIndex = scanPartition.getPartitionIndex();
             this.requiredColumns = scanPartition.getRequiredColumns();
-            this.filters = Arrays.asList(scanPartition.getFilters());
+            this.filters = scanPartition.getFilters();
 
 
             ScanResponse scanResponse = connector.scan(partitionIndex, requiredColumns, filters);
@@ -131,15 +132,15 @@ public class DynamoReaderFactory implements PartitionReaderFactory {
                                 requiredColumns.stream()
                                         .map(columnName -> typeConversions.get(columnName).apply(item))
                                         .collect(Collectors.toList())
-                        ).toSeq()
+                        ).toList()
                 );
             } else {
                 return InternalRow.fromSeq(
                         JavaConverters.asScalaBuffer(
                                 item.values().stream()
-                                        .map(value -> (Object) value.toString()) // ✅ Explicitly cast to Object
+                                        .map(value -> (Object) value.toString())
                                         .collect(Collectors.toList())
-                        ).toSeq()
+                        ).toList()
                 );
             }
         }
@@ -148,19 +149,19 @@ public class DynamoReaderFactory implements PartitionReaderFactory {
     private class QueryPartitionReader implements PartitionReader<InternalRow> {
         private final Iterator<Map<String, AttributeValue>> itemsIterator;
         private final List<String> requiredColumns;
-        private final List<org.apache.spark.sql.sources.Filter> filters;
+        private final Filter[] filters;
         private final int partitionIndex;
         private final Map<String, Function<Map<String, AttributeValue>, Object>> typeConversions;
 
 
-        public QueryPartitionReader(QueryPartition partition) {
+        public QueryPartitionReader(ScanPartition partition) {
             this.requiredColumns = partition.getRequiredColumns();
             this.filters = partition.getFilters();
             this.partitionIndex = partition.getPartitionIndex();
 
-
             List<Map<String, AttributeValue>> fullResult = connector.query(partitionIndex, requiredColumns, filters);
             this.itemsIterator = fullResult.iterator();
+
 
             this.typeConversions = Arrays.stream(schema.fields())
                     .collect(Collectors.toMap(StructField::name, field -> TypeConversion.apply(field.name(), field.dataType())));
@@ -184,21 +185,22 @@ public class DynamoReaderFactory implements PartitionReaderFactory {
 
         private InternalRow itemToRow(Map<String, AttributeValue> item) {
             if (!requiredColumns.isEmpty()) {
-                return InternalRow.fromSeq(
-                        JavaConverters.asScalaBuffer(
-                                requiredColumns.stream()
-                                        .map(columnName -> typeConversions.get(columnName).apply(item))
-                                        .collect(Collectors.toList())
-                        ).toSeq()
-                );
+                // Manually convert Java List to Scala Seq
+                List<Object> values = requiredColumns.stream()
+                        .map(columnName -> typeConversions.get(columnName).apply(item))
+                        .collect(Collectors.toList());
+
+
+                return InternalRow.fromSeq(JavaConverters.asScalaBuffer(values).toList());
+
             } else {
-                return InternalRow.fromSeq(
-                        JavaConverters.asScalaBuffer(
-                                item.values().stream()
-                                        .map(value -> (Object) value.toString()) // ✅ Explicitly cast to Object
-                                        .collect(Collectors.toList())
-                        ).toSeq()
-                );
+                // Manually convert Java Map values to Scala Seq
+                List<Object> values = item.values().stream()
+                        .map(value -> (Object) value.toString())
+                        .collect(Collectors.toList());
+
+                return InternalRow.fromSeq(JavaConverters.asScalaBuffer(values).toList());
+
             }
         }
     }

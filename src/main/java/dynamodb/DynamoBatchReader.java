@@ -1,12 +1,14 @@
 package dynamodb;
 
 import dynamodb.readers.DynamoReaderFactory;
+import org.apache.commons.lang3.NotImplementedException;
 import org.apache.spark.sql.connector.read.*;
 import org.apache.spark.sql.connector.read.partitioning.Partitioning;
 import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.IntStream;
 

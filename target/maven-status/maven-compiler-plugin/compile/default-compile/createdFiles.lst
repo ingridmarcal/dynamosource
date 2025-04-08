@@ -18,6 +18,7 @@ trivial/InMemoryPartitionReaderFactory.class
 trivial/InMemoryScan.class
 dynamodb/DynamoTable.class
 dynamodb/DynamoConnector.class
+dynamodb/readers/DynamoReaderFactory$1.class
 dynamodb/FilterPushdown$Tuple.class
 dynamodb/FilterPushdown.class
 trivial/InMemoryPartitionReader.class

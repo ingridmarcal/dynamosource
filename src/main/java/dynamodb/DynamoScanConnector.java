@@ -95,7 +95,7 @@ public class DynamoScanConnector extends DynamoConnector implements Serializable
 
     @Override
     public List<Map<String, AttributeValue>> query(int segmentNum, List<String> columns, Filter[] filters) {
-        return List.of();
+        return java.util.Collections.emptyList();
     }
 
     @Override

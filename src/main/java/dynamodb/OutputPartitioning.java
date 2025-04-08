@@ -4,11 +4,21 @@ import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.read.partitioning.KeyGroupedPartitioning;
 import org.apache.spark.sql.connector.read.partitioning.Partitioning;
 
-public class OutputPartitioning extends KeyGroupedPartitioning {
+import java.io.Serializable;
 
-    public OutputPartitioning(Expression[]  partitionKeys, int numPartitions) {
-        super(partitionKeys, numPartitions);
+public class OutputPartitioning implements Partitioning {
+    private final KeyGroupedPartitioning delegate;
+
+    public OutputPartitioning(Expression[] keys, int numPartitions) {
+        this.delegate = new KeyGroupedPartitioning(keys, numPartitions);
     }
 
+    @Override
+    public int numPartitions() {
+        return delegate.numPartitions();
+    }
 
+    public Expression[] keys() {
+        return delegate.keys();
+    }
 }

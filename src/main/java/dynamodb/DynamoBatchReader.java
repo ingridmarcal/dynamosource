@@ -2,7 +2,10 @@ package dynamodb;
 
 import dynamodb.readers.DynamoReaderFactory;
 import org.apache.commons.lang3.NotImplementedException;
+import org.apache.spark.sql.connector.expressions.Expression;
+import org.apache.spark.sql.connector.expressions.Expressions;
 import org.apache.spark.sql.connector.read.*;
+import org.apache.spark.sql.connector.read.partitioning.KeyGroupedPartitioning;
 import org.apache.spark.sql.connector.read.partitioning.Partitioning;
 import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.types.StructField;
@@ -53,7 +56,10 @@ public class DynamoBatchReader implements Scan, Batch, SupportsReportPartitionin
 
     @Override
     public Partitioning outputPartitioning() {
-        return new OutputPartitioning(connector.getTotalSegments());
+        return new KeyGroupedPartitioning(
+                new Expression[] { Expressions.identity(connector.getKeySchema().getHashKeyName()) },
+                connector.getTotalSegments()
+        );
     }
 }
 

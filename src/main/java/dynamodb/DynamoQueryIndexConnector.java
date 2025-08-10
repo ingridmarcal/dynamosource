@@ -79,18 +79,12 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
 
         // User parameters
         int bytesPerRCU = Integer.parseInt(parameters.getOrDefault("bytesperrcu", "4000"));
-        int maxPartitionBytes = Integer.parseInt(parameters.getOrDefault("maxpartitionbytes", "128000000"));
         double targetCapacity = Double.parseDouble(parameters.getOrDefault("targetcapacity", "1"));
         int readFactor = consistentRead ? 1 : 2;
 
         // Index parameters
         long indexSize = indexDesc.indexSizeBytes();
         long itemCount = indexDesc.itemCount() > 0 ? indexDesc.itemCount() : 1; // Avoid division by zero
-
-        // Partitioning calculation
-        int numPartitions = parameters.containsKey("readpartitions")
-                ? Integer.parseInt(parameters.get("readpartitions"))
-                : Math.max(1, (int) (indexSize / maxPartitionBytes));
 
         // Provisioned or on-demand throughput
         long readThroughput = parameters.containsKey("throughput")
@@ -104,7 +98,8 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
         double rateLimit = readThroughput * targetCapacity / parallelism;
         this.itemLimit = Math.max(1, (int) ((bytesPerRCU / avgItemSize) * rateLimit * readFactor));
         this.readLimit = rateLimit;
-        this.totalSegments = numPartitions;
+        // Query operations cannot be reliably partitioned, so force a single segment
+        this.totalSegments = 1;
     }
 
     // Lazy initialization for DynamoDbClient
@@ -159,6 +154,10 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
     @Override
     public QueryIterable query(int segmentNum, List<String> columns, Filter[] filters) {
         initDynamoDbClient(); // Ensure client is initialized on executor
+
+        if (segmentNum != 0) {
+            throw new IllegalArgumentException("Query operations do not support parallel segments; segmentNum must be 0");
+        }
 
         Map<String, AttributeValue> expressionValues = getExpressionAttributeValues();
 

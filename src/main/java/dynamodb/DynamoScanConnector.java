@@ -5,6 +5,7 @@ import software.amazon.awssdk.services.dynamodb.model.*;
 import software.amazon.awssdk.services.dynamodb.paginators.QueryIterable;
 
 import java.io.Serializable;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.spark.sql.sources.Filter;
@@ -86,9 +87,21 @@ public class DynamoScanConnector extends DynamoConnector implements Serializable
         }
 
         // Handle filter conditions
+        Map<String, String> expressionAttributeNames = new HashMap<>();
+        Map<String, AttributeValue> expressionAttributeValues = new HashMap<>();
+
         if (filters != null && filterPushdown) {
-            String filterExpression = FilterPushdown.apply(filters);
-            scanRequestBuilder.filterExpression(filterExpression);
+            FilterPushdown.Result result = FilterPushdown.apply(filters);
+            scanRequestBuilder.filterExpression(result.getExpression());
+            expressionAttributeNames.putAll(result.getExpressionAttributeNames());
+            expressionAttributeValues.putAll(result.getExpressionAttributeValues());
+        }
+
+        if (!expressionAttributeNames.isEmpty()) {
+            scanRequestBuilder.expressionAttributeNames(expressionAttributeNames);
+        }
+        if (!expressionAttributeValues.isEmpty()) {
+            scanRequestBuilder.expressionAttributeValues(expressionAttributeValues);
         }
 
         return dynamoDbClient.scan(scanRequestBuilder.build());

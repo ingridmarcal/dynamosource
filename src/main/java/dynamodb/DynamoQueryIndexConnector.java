@@ -137,16 +137,32 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
                 .returnConsumedCapacity(ReturnConsumedCapacity.TOTAL)
                 .consistentRead(consistentRead);
 
+        Map<String, String> expressionAttributeNames = new HashMap<>();
+        Map<String, AttributeValue> expressionAttributeValues = new HashMap<>();
+
         if (!columns.isEmpty()) {
-            scanRequestBuilder.projectionExpression(String.join(", ", columns));
-        }
-
-        if(filters != null) {
-            if (filters.length > 0 && filterPushdown) {
-                scanRequestBuilder.filterExpression(FilterPushdown.apply(filters));
+            List<String> projectionFields = new ArrayList<>();
+            for (String column : columns) {
+                String placeholder = "#" + column;
+                expressionAttributeNames.put(placeholder, column);
+                projectionFields.add(placeholder);
             }
+            scanRequestBuilder.projectionExpression(String.join(", ", projectionFields));
         }
 
+        if (filters != null && filters.length > 0 && filterPushdown) {
+            FilterPushdown.Result result = FilterPushdown.apply(filters);
+            scanRequestBuilder.filterExpression(result.getExpression());
+            expressionAttributeNames.putAll(result.getExpressionAttributeNames());
+            expressionAttributeValues.putAll(result.getExpressionAttributeValues());
+        }
+
+        if (!expressionAttributeNames.isEmpty()) {
+            scanRequestBuilder.expressionAttributeNames(expressionAttributeNames);
+        }
+        if (!expressionAttributeValues.isEmpty()) {
+            scanRequestBuilder.expressionAttributeValues(expressionAttributeValues);
+        }
 
         return dynamoDbClient.scan(scanRequestBuilder.build());
     }
@@ -159,7 +175,8 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
             throw new IllegalArgumentException("Query operations do not support parallel segments; segmentNum must be 0");
         }
 
-        Map<String, AttributeValue> expressionValues = getExpressionAttributeValues();
+        Map<String, String> expressionAttributeNames = new HashMap<>();
+        Map<String, AttributeValue> expressionAttributeValues = new HashMap<>(getExpressionAttributeValues());
 
         return dynamoDbClient.queryPaginator(queryRequest -> {
             queryRequest
@@ -173,29 +190,32 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
             }
 
             if (filterPushdown && filters != null) {
-                queryRequest.filterExpression(FilterPushdown.apply(filters));
+                FilterPushdown.Result result = FilterPushdown.apply(filters);
+                queryRequest.filterExpression(result.getExpression());
+                expressionAttributeNames.putAll(result.getExpressionAttributeNames());
+                expressionAttributeValues.putAll(result.getExpressionAttributeValues());
             }
 
             if (!columns.isEmpty()) {
-                // Create mappings for reserved keywords
-                Map<String, String> expressionAttributeNames = new HashMap<>();
+                Map<String, String> projectionNames = new HashMap<>();
                 List<String> projectionFields = new ArrayList<>();
 
                 for (String column : columns) {
                     String placeholder = "#" + column;
-                    expressionAttributeNames.put(placeholder, column);
+                    projectionNames.put(placeholder, column);
                     projectionFields.add(placeholder);
                 }
 
-                // Set ProjectionExpression with placeholders
                 queryRequest.projectionExpression(String.join(", ", projectionFields));
-
-                queryRequest.expressionAttributeNames(expressionAttributeNames);
-
+                expressionAttributeNames.putAll(projectionNames);
             }
 
-            if (expressionValues != null && !expressionValues.isEmpty()) {
-                queryRequest.expressionAttributeValues(expressionValues);
+            if (!expressionAttributeNames.isEmpty()) {
+                queryRequest.expressionAttributeNames(expressionAttributeNames);
+            }
+
+            if (!expressionAttributeValues.isEmpty()) {
+                queryRequest.expressionAttributeValues(expressionAttributeValues);
             }
         });
     }

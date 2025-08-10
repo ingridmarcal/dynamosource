@@ -82,6 +82,12 @@
       <version>2.4.4</version>
       <scope>provided</scope>
     </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
   <properties>
     <scala.version>2.12.18</scala.version>

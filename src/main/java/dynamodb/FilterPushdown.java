@@ -1,18 +1,20 @@
 package dynamodb;
 
-import software.amazon.awssdk.services.dynamodb.model.Condition;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import org.apache.spark.sql.sources.*;
+
 import java.util.*;
 import java.util.stream.Collectors;
 
 public class FilterPushdown {
 
-    public static String apply(Filter[] filters) {
-        return Arrays.stream(filters)  // Convert array to stream
-                .map(FilterPushdown::buildCondition)
+    public static Result apply(Filter[] filters) {
+        PlaceholderContext context = new PlaceholderContext();
+        String expression = Arrays.stream(filters)
+                .map(f -> buildCondition(f, context))
                 .map(FilterPushdown::parenthesize)
                 .collect(Collectors.joining(" AND "));
+        return new Result(expression, context.getExpressionAttributeNames(), context.getExpressionAttributeValues());
     }
 
     public static Tuple<List<Filter>, List<Filter>> acceptFilters(Filter[] filters) {
@@ -43,50 +45,130 @@ public class FilterPushdown {
         return true;
     }
 
-    private static String buildCondition(Filter filter) {
+    private static String buildCondition(Filter filter, PlaceholderContext context) {
         if (filter instanceof EqualTo) {
-            return String.format("%s = %s", ((EqualTo) filter).attribute(), formatValue(((EqualTo) filter).value()));
+            String name = context.addAttributeName(((EqualTo) filter).attribute());
+            String value = context.addAttributeValue(((EqualTo) filter).value());
+            return String.format("%s = %s", name, value);
         } else if (filter instanceof GreaterThan) {
-            return String.format("%s > %s", ((GreaterThan) filter).attribute(), formatValue(((GreaterThan) filter).value()));
+            String name = context.addAttributeName(((GreaterThan) filter).attribute());
+            String value = context.addAttributeValue(((GreaterThan) filter).value());
+            return String.format("%s > %s", name, value);
         } else if (filter instanceof GreaterThanOrEqual) {
-            return String.format("%s >= %s", ((GreaterThanOrEqual) filter).attribute(), formatValue(((GreaterThanOrEqual) filter).value()));
+            String name = context.addAttributeName(((GreaterThanOrEqual) filter).attribute());
+            String value = context.addAttributeValue(((GreaterThanOrEqual) filter).value());
+            return String.format("%s >= %s", name, value);
         } else if (filter instanceof LessThan) {
-            return String.format("%s < %s", ((LessThan) filter).attribute(), formatValue(((LessThan) filter).value()));
+            String name = context.addAttributeName(((LessThan) filter).attribute());
+            String value = context.addAttributeValue(((LessThan) filter).value());
+            return String.format("%s < %s", name, value);
         } else if (filter instanceof LessThanOrEqual) {
-            return String.format("%s <= %s", ((LessThanOrEqual) filter).attribute(), formatValue(((LessThanOrEqual) filter).value()));
+            String name = context.addAttributeName(((LessThanOrEqual) filter).attribute());
+            String value = context.addAttributeValue(((LessThanOrEqual) filter).value());
+            return String.format("%s <= %s", name, value);
         } else if (filter instanceof In) {
-            List<Object> values = Arrays.asList(((In) filter).values()); // Convert to List
-            String formattedValues = values.stream()
-                    .map(FilterPushdown::formatValue)
+            String name = context.addAttributeName(((In) filter).attribute());
+            Object[] vals = ((In) filter).values();
+            String placeholders = Arrays.stream(vals)
+                    .map(context::addAttributeValue)
                     .collect(Collectors.joining(", "));
-            return String.format("%s IN (%s)", ((In) filter).attribute(), formattedValues);
+            return String.format("%s IN (%s)", name, placeholders);
         } else if (filter instanceof IsNull) {
-            return String.format("attribute_not_exists(%s)", ((IsNull) filter).attribute());
+            String name = context.addAttributeName(((IsNull) filter).attribute());
+            return String.format("attribute_not_exists(%s)", name);
         } else if (filter instanceof IsNotNull) {
-            return String.format("attribute_exists(%s)", ((IsNotNull) filter).attribute());
+            String name = context.addAttributeName(((IsNotNull) filter).attribute());
+            return String.format("attribute_exists(%s)", name);
         } else if (filter instanceof StringStartsWith) {
-            return String.format("begins_with(%s, %s)", ((StringStartsWith) filter).attribute(), formatValue(((StringStartsWith) filter).value()));
+            String name = context.addAttributeName(((StringStartsWith) filter).attribute());
+            String value = context.addAttributeValue(((StringStartsWith) filter).value());
+            return String.format("begins_with(%s, %s)", name, value);
         } else if (filter instanceof StringContains) {
-            return String.format("contains(%s, %s)", ((StringContains) filter).attribute(), formatValue(((StringContains) filter).value()));
+            String name = context.addAttributeName(((StringContains) filter).attribute());
+            String value = context.addAttributeValue(((StringContains) filter).value());
+            return String.format("contains(%s, %s)", name, value);
         } else if (filter instanceof And) {
-            return String.format("(%s AND %s)", buildCondition(((And) filter).left()), buildCondition(((And) filter).right()));
+            return String.format("(%s AND %s)",
+                    buildCondition(((And) filter).left(), context),
+                    buildCondition(((And) filter).right(), context));
         } else if (filter instanceof Or) {
-            return String.format("(%s OR %s)", buildCondition(((Or) filter).left()), buildCondition(((Or) filter).right()));
+            return String.format("(%s OR %s)",
+                    buildCondition(((Or) filter).left(), context),
+                    buildCondition(((Or) filter).right(), context));
         } else if (filter instanceof Not) {
-            return String.format("NOT (%s)", buildCondition(((Not) filter).child()));
+            return String.format("NOT (%s)", buildCondition(((Not) filter).child(), context));
         }
         throw new UnsupportedOperationException("Unsupported filter type: " + filter.getClass().getSimpleName());
     }
 
-    private static String formatValue(Object value) {
-        if (value instanceof String) return String.format("'%s'", value);
-        if (value instanceof Number) return value.toString();
-        if (value instanceof Boolean) return value.toString();
+    private static AttributeValue toAttributeValue(Object value) {
+        if (value instanceof String) {
+            return AttributeValue.builder().s((String) value).build();
+        }
+        if (value instanceof Number) {
+            return AttributeValue.builder().n(value.toString()).build();
+        }
+        if (value instanceof Boolean) {
+            return AttributeValue.builder().bool((Boolean) value).build();
+        }
         throw new IllegalArgumentException("Unsupported value type for DynamoDB filter: " + value.getClass().getSimpleName());
     }
 
     private static String parenthesize(String condition) {
         return "(" + condition + ")";
+    }
+
+    private static class PlaceholderContext {
+        private final Map<String, String> expressionAttributeNames = new LinkedHashMap<>();
+        private final Map<String, AttributeValue> expressionAttributeValues = new LinkedHashMap<>();
+        private int nameCounter = 0;
+        private int valueCounter = 0;
+
+        String addAttributeName(String actualName) {
+            String placeholder = "#n" + nameCounter++;
+            expressionAttributeNames.put(placeholder, actualName);
+            return placeholder;
+        }
+
+        String addAttributeValue(Object value) {
+            String placeholder = ":v" + valueCounter++;
+            expressionAttributeValues.put(placeholder, toAttributeValue(value));
+            return placeholder;
+        }
+
+        Map<String, String> getExpressionAttributeNames() {
+            return expressionAttributeNames;
+        }
+
+        Map<String, AttributeValue> getExpressionAttributeValues() {
+            return expressionAttributeValues;
+        }
+    }
+
+    public static class Result {
+        private final String expression;
+        private final Map<String, String> expressionAttributeNames;
+        private final Map<String, AttributeValue> expressionAttributeValues;
+
+        public Result(String expression,
+                      Map<String, String> expressionAttributeNames,
+                      Map<String, AttributeValue> expressionAttributeValues) {
+            this.expression = expression;
+            this.expressionAttributeNames = expressionAttributeNames;
+            this.expressionAttributeValues = expressionAttributeValues;
+        }
+
+        public String getExpression() {
+            return expression;
+        }
+
+        public Map<String, String> getExpressionAttributeNames() {
+            return expressionAttributeNames;
+        }
+
+        public Map<String, AttributeValue> getExpressionAttributeValues() {
+            return expressionAttributeValues;
+        }
     }
 
     public static class Tuple<A, B> {

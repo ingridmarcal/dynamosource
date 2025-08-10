@@ -2,6 +2,7 @@ package dynamodb;
 
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
+import software.amazon.awssdk.services.dynamodb.paginators.QueryIterable;
 
 import java.io.Serializable;
 import java.util.List;
@@ -94,8 +95,8 @@ public class DynamoScanConnector extends DynamoConnector implements Serializable
     }
 
     @Override
-    public List<Map<String, AttributeValue>> query(int segmentNum, List<String> columns, Filter[] filters) {
-        return java.util.Collections.emptyList();
+    public QueryIterable query(int segmentNum, List<String> columns, Filter[] filters) {
+        throw new UnsupportedOperationException("Query not supported for scan connector");
     }
 
     @Override

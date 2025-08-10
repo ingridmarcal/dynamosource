@@ -157,13 +157,12 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
     }
 
     @Override
-    public List<Map<String, AttributeValue>> query(int segmentNum, List<String> columns, Filter[] filters) {
+    public QueryIterable query(int segmentNum, List<String> columns, Filter[] filters) {
         initDynamoDbClient(); // Ensure client is initialized on executor
-        List<Map<String, AttributeValue>> fullResult = new ArrayList<>();
 
         Map<String, AttributeValue> expressionValues = getExpressionAttributeValues();
 
-        QueryIterable queryIterable = dynamoDbClient.queryPaginator(queryRequest -> {
+        return dynamoDbClient.queryPaginator(queryRequest -> {
             queryRequest
                     .tableName(tableName)
                     .indexName(indexName)
@@ -184,9 +183,9 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
                 List<String> projectionFields = new ArrayList<>();
 
                 for (String column : columns) {
-                        String placeholder = "#" + column;
-                        expressionAttributeNames.put(placeholder, column);
-                        projectionFields.add(placeholder);
+                    String placeholder = "#" + column;
+                    expressionAttributeNames.put(placeholder, column);
+                    projectionFields.add(placeholder);
                 }
 
                 // Set ProjectionExpression with placeholders
@@ -200,12 +199,6 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
                 queryRequest.expressionAttributeValues(expressionValues);
             }
         });
-
-        for (QueryResponse page : queryIterable) {
-            fullResult.addAll(page.items());
-        }
-
-        return fullResult;
     }
 
     @Override

@@ -14,6 +14,8 @@ import org.apache.spark.sql.types.StructType;
 import scala.collection.JavaConverters;
 import software.amazon.awssdk.services.dynamodb.model.ScanResponse;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+import software.amazon.awssdk.services.dynamodb.model.QueryResponse;
+import software.amazon.awssdk.services.dynamodb.paginators.QueryIterable;
 
 import java.io.IOException;
 import java.util.*;
@@ -147,60 +149,62 @@ public class DynamoReaderFactory implements PartitionReaderFactory {
     }
 
     private class QueryPartitionReader implements PartitionReader<InternalRow> {
-        private final Iterator<Map<String, AttributeValue>> itemsIterator;
+        private final Iterator<QueryResponse> pageIterator;
+        private Iterator<Map<String, AttributeValue>> itemIterator = Collections.emptyIterator();
         private final List<String> requiredColumns;
-        private final Filter[] filters;
-        private final int partitionIndex;
+        private final RateLimiter rateLimiter;
         private final Map<String, Function<Map<String, AttributeValue>, Object>> typeConversions;
-
 
         public QueryPartitionReader(ScanPartition partition) {
             this.requiredColumns = partition.getRequiredColumns();
-            this.filters = partition.getFilters();
-            this.partitionIndex = partition.getPartitionIndex();
 
-            List<Map<String, AttributeValue>> fullResult = connector.query(partitionIndex, requiredColumns, filters);
-            this.itemsIterator = fullResult.iterator();
-
+            QueryIterable queryIterable = connector.query(
+                    partition.getPartitionIndex(),
+                    requiredColumns,
+                    partition.getFilters()
+            );
+            this.pageIterator = queryIterable.iterator();
+            this.rateLimiter = RateLimiter.create(connector.getReadLimit());
 
             this.typeConversions = Arrays.stream(schema.fields())
-                    .collect(Collectors.toMap(StructField::name, field -> TypeConversion.apply(field.name(), field.dataType())));
+                    .collect(Collectors.toMap(StructField::name,
+                            field -> TypeConversion.apply(field.name(), field.dataType())));
         }
 
         @Override
         public boolean next() {
-            return itemsIterator.hasNext();
+            if (itemIterator.hasNext()) {
+                return true;
+            }
+            while (!itemIterator.hasNext() && pageIterator.hasNext()) {
+                rateLimiter.acquire();
+                QueryResponse page = pageIterator.next();
+                itemIterator = page.items().iterator();
+            }
+            return itemIterator.hasNext();
         }
 
         @Override
         public InternalRow get() {
-            Map<String, AttributeValue> item = itemsIterator.next();
-            return itemToRow(item); // Convert DynamoDB item to Spark InternalRow
+            Map<String, AttributeValue> item = itemIterator.next();
+            return itemToRow(item);
         }
 
         @Override
         public void close() throws IOException {
-
         }
 
         private InternalRow itemToRow(Map<String, AttributeValue> item) {
             if (!requiredColumns.isEmpty()) {
-                // Manually convert Java List to Scala Seq
                 List<Object> values = requiredColumns.stream()
                         .map(columnName -> typeConversions.get(columnName).apply(item))
                         .collect(Collectors.toList());
-
-
                 return InternalRow.fromSeq(JavaConverters.asScalaBuffer(values).toList());
-
             } else {
-                // Manually convert Java Map values to Scala Seq
                 List<Object> values = item.values().stream()
                         .map(value -> (Object) value.toString())
                         .collect(Collectors.toList());
-
                 return InternalRow.fromSeq(JavaConverters.asScalaBuffer(values).toList());
-
             }
         }
     }

@@ -158,13 +158,13 @@ public class DynamoReaderFactory implements PartitionReaderFactory {
         public QueryPartitionReader(ScanPartition partition) {
             this.requiredColumns = partition.getRequiredColumns();
 
+            this.rateLimiter = RateLimiter.create(connector.getReadLimit());
             QueryIterable queryIterable = connector.query(
                     partition.getPartitionIndex(),
                     requiredColumns,
                     partition.getFilters()
             );
             this.pageIterator = queryIterable.iterator();
-            this.rateLimiter = RateLimiter.create(connector.getReadLimit());
 
             this.typeConversions = Arrays.stream(schema.fields())
                     .collect(Collectors.toMap(StructField::name,
@@ -177,7 +177,7 @@ public class DynamoReaderFactory implements PartitionReaderFactory {
                 return true;
             }
             while (!itemIterator.hasNext() && pageIterator.hasNext()) {
-                rateLimiter.acquire();
+                rateLimiter.acquire(connector.getItemLimit());
                 QueryResponse page = pageIterator.next();
                 itemIterator = page.items().iterator();
             }

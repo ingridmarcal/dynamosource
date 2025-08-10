@@ -35,3 +35,16 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+# Build artifacts
+target/
+dependency-reduced-pom.xml
+
+# Compiled class files
+*.class
+
+# Generated resources
+/META-INF/
+VersionInfo.java
+mime.types
+mozilla/

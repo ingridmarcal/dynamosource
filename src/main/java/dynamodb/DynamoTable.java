@@ -52,7 +52,17 @@ public class DynamoTable implements Table, SupportsRead {
 
     @Override
     public StructType schema() {
-        return userSchema != null ? userSchema : inferSchema();
+        if (userSchema != null) {
+            return userSchema;
+        }
+
+        if (dynamoConnector.isQuery()) {
+            throw new IllegalArgumentException(
+                    "Schema inference is not supported for index queries. " +
+                    "Please supply `userSchema` when reading via a secondary index.");
+        }
+
+        return inferSchema();
     }
 
     @Override

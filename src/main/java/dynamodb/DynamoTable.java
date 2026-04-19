@@ -10,7 +10,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import scala.Option;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
-import software.amazon.awssdk.services.dynamodb.model.ScanResponse;
 
 import java.math.BigDecimal;
 import java.util.*;
@@ -26,17 +25,19 @@ public class DynamoTable implements Table, SupportsRead {
     public DynamoTable(Map<String, String> options, StructType userSchema) {
         this.userSchema = userSchema;
 
-        this.tableName = options.getOrDefault("tablename", "Unknown");
-        String indexName = options.get("indexname");
+        Map<String, String> normalized = normalizeKeys(options);
 
-        int defaultParallelism = options.containsKey("defaultparallelism")
-                ? Integer.parseInt(options.get("defaultparallelism"))
+        this.tableName = normalized.getOrDefault("tablename", "Unknown");
+        String indexName = normalized.get("indexname");
+
+        int defaultParallelism = normalized.containsKey("defaultparallelism")
+                ? Integer.parseInt(normalized.get("defaultparallelism"))
                 : getDefaultParallelism();
 
-        if (indexName != null) {
-            this.dynamoConnector = new DynamoQueryIndexConnector(this.tableName, indexName, defaultParallelism, options);
+        if (indexName != null && !indexName.isEmpty()) {
+            this.dynamoConnector = new DynamoQueryIndexConnector(this.tableName, indexName, defaultParallelism, normalized);
         } else {
-            this.dynamoConnector = new DynamoScanConnector(this.tableName, defaultParallelism, options);
+            this.dynamoConnector = new DynamoScanConnector(this.tableName, defaultParallelism, normalized);
         }
     }
 
@@ -56,10 +57,10 @@ public class DynamoTable implements Table, SupportsRead {
             return userSchema;
         }
 
-        if (dynamoConnector.isQuery()) {
+        if (dynamoConnector.isIndex()) {
             throw new IllegalArgumentException(
-                    "Schema inference is not supported for index queries. " +
-                    "Please supply `userSchema` when reading via a secondary index.");
+                    "Schema inference is not supported for secondary index reads. "
+                            + "Please supply an explicit schema via `.schema(userSchema)`.");
         }
 
         return inferSchema();
@@ -78,25 +79,29 @@ public class DynamoTable implements Table, SupportsRead {
 
         if (sparkSession.isDefined()) {
             return sparkSession.get().sparkContext().defaultParallelism();
-        } else {
-            logger.warn("Unable to read defaultParallelism from SparkSession. Parallelism will be 1 unless overridden with option `defaultParallelism`");
-            return 1;
         }
+        logger.warn("Unable to read defaultParallelism from SparkSession; defaulting to 1. "
+                + "Override with option `defaultParallelism` if needed.");
+        return 1;
     }
 
     private StructType inferSchema() {
         List<Map<String, AttributeValue>> inferenceItems = new ArrayList<>();
 
         if (dynamoConnector.nonEmpty()) {
-            ScanResponse scanResponse = dynamoConnector.scan(0, Collections.emptyList(), new Filter[0]);
-            inferenceItems = scanResponse.items();
+            Iterator<Map<String, AttributeValue>> items = dynamoConnector.readItems(
+                    0, Collections.emptyList(), new Filter[0]);
+            int limit = 500;
+            while (items.hasNext() && limit-- > 0) {
+                inferenceItems.add(items.next());
+            }
         }
 
-        Map<String, DataType> typeMapping = new HashMap<>();
+        Map<String, DataType> typeMapping = new LinkedHashMap<>();
 
         for (Map<String, AttributeValue> item : inferenceItems) {
             for (Map.Entry<String, AttributeValue> entry : item.entrySet()) {
-                typeMapping.put(entry.getKey(), inferType(entry.getValue()));
+                typeMapping.putIfAbsent(entry.getKey(), inferType(entry.getValue()));
             }
         }
 
@@ -112,39 +117,61 @@ public class DynamoTable implements Table, SupportsRead {
         return new StructType(typeSeq.toArray(new StructField[0]));
     }
 
-    private DataType inferType(Object value) {
-        if (value instanceof BigDecimal) {
-            BigDecimal number = (BigDecimal) value;
-            if (number.scale() == 0) {
-                if (number.precision() < 10) return DataTypes.IntegerType;
-                else if (number.precision() < 19) return DataTypes.LongType;
-                else return DataTypes.createDecimalType(number.precision(), number.scale());
-            } else {
-                return DataTypes.DoubleType;
-            }
-        } else if (value instanceof List) {
-            List<?> list = (List<?>) value;
-            if (list.isEmpty()) return DataTypes.createArrayType(DataTypes.StringType);
-            return DataTypes.createArrayType(inferType(list.get(0)));
-        } else if (value instanceof Set) {
-            Set<?> set = (Set<?>) value;
-            if (set.isEmpty()) return DataTypes.createArrayType(DataTypes.StringType);
-            return DataTypes.createArrayType(inferType(set.iterator().next()));
-        } else if (value instanceof Map) {
-            Map<?, ?> map = (Map<?, ?>) value;
-            List<StructField> mapFields = new ArrayList<>();
-            for (Map.Entry<?, ?> entry : map.entrySet()) {
-                if (entry.getKey() instanceof String) {
-                    mapFields.add(new StructField((String) entry.getKey(), inferType(entry.getValue()), true, Metadata.empty()));
-                }
-            }
-            return new StructType(mapFields.toArray(new StructField[0]));
-        } else if (value instanceof Boolean) {
-            return DataTypes.BooleanType;
-        } else if (value instanceof byte[]) {
-            return DataTypes.BinaryType;
-        } else {
+    private DataType inferType(AttributeValue value) {
+        if (value == null) {
             return DataTypes.StringType;
         }
+        if (value.bool() != null) {
+            return DataTypes.BooleanType;
+        }
+        if (value.n() != null) {
+            try {
+                BigDecimal number = new BigDecimal(value.n());
+                if (number.scale() == 0) {
+                    if (number.precision() < 10) return DataTypes.IntegerType;
+                    else if (number.precision() < 19) return DataTypes.LongType;
+                    else return DataTypes.createDecimalType(number.precision(), number.scale());
+                }
+                return DataTypes.DoubleType;
+            } catch (NumberFormatException ignored) {
+                return DataTypes.StringType;
+            }
+        }
+        if (value.s() != null) {
+            return DataTypes.StringType;
+        }
+        if (value.b() != null) {
+            return DataTypes.BinaryType;
+        }
+        if (value.hasL()) {
+            List<AttributeValue> list = value.l();
+            if (list.isEmpty()) return DataTypes.createArrayType(DataTypes.StringType);
+            return DataTypes.createArrayType(inferType(list.get(0)));
+        }
+        if (value.hasSs()) {
+            return DataTypes.createArrayType(DataTypes.StringType);
+        }
+        if (value.hasNs()) {
+            return DataTypes.createArrayType(DataTypes.DoubleType);
+        }
+        if (value.hasM()) {
+            Map<String, AttributeValue> map = value.m();
+            List<StructField> mapFields = new ArrayList<>();
+            for (Map.Entry<String, AttributeValue> entry : map.entrySet()) {
+                mapFields.add(new StructField(entry.getKey(), inferType(entry.getValue()), true, Metadata.empty()));
+            }
+            return new StructType(mapFields.toArray(new StructField[0]));
+        }
+        return DataTypes.StringType;
+    }
+
+    private static Map<String, String> normalizeKeys(Map<String, String> options) {
+        if (options == null) return Collections.emptyMap();
+        Map<String, String> out = new HashMap<>();
+        for (Map.Entry<String, String> e : options.entrySet()) {
+            if (e.getKey() == null) continue;
+            out.put(e.getKey().toLowerCase(Locale.ROOT), e.getValue());
+        }
+        return out;
     }
 }

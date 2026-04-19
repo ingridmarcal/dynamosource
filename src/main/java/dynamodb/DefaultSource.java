@@ -9,17 +9,20 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 import java.util.Map;
 
+/**
+ * Spark {@link TableProvider} registered under the short name {@code dynamodb}.
+ * Resolved at runtime through
+ * {@code META-INF/services/org.apache.spark.sql.sources.DataSourceRegister}.
+ */
 public class DefaultSource implements TableProvider, DataSourceRegister {
 
     @Override
     public StructType inferSchema(CaseInsensitiveStringMap options) {
-        // Pass null for userSchema when it's not provided
-        return new DynamoTable(options, null).schema();
+        return new DynamoTable(options.asCaseSensitiveMap(), null).schema();
     }
 
     @Override
     public Table getTable(StructType schema, Transform[] partitioning, Map<String, String> properties) {
-        // Directly pass the schema, can be null
         return new DynamoTable(properties, schema);
     }
 

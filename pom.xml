@@ -12,28 +12,30 @@
         <maven.compiler.source>1.8</maven.compiler.source>
         <maven.compiler.target>1.8</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <aws.sdk.version>2.20.52</aws.sdk.version>  <!-- Centralized AWS SDK version -->
+        <aws.sdk.version>2.20.52</aws.sdk.version>
         <scala.version>2.12.18</scala.version>
+        <scala.binary.version>2.12</scala.binary.version>
         <spark.version>3.5.5</spark.version>
+        <junit.jupiter.version>5.10.2</junit.jupiter.version>
     </properties>
 
     <dependencies>
-        <!-- Use Spark 3.5.5 built for Scala 2.12 -->
+        <!-- Spark 3.5 built for Scala 2.12 -->
         <dependency>
             <groupId>org.apache.spark</groupId>
-            <artifactId>spark-core_2.12</artifactId>
+            <artifactId>spark-core_${scala.binary.version}</artifactId>
             <version>${spark.version}</version>
             <scope>provided</scope>
         </dependency>
 
         <dependency>
             <groupId>org.apache.spark</groupId>
-            <artifactId>spark-sql_2.12</artifactId>
+            <artifactId>spark-sql_${scala.binary.version}</artifactId>
             <version>${spark.version}</version>
             <scope>provided</scope>
         </dependency>
 
-        <!-- Ensure Scala 2.12 -->
+        <!-- Scala standard library (provided by Spark at runtime) -->
         <dependency>
             <groupId>org.scala-lang</groupId>
             <artifactId>scala-library</artifactId>
@@ -50,50 +52,68 @@
 
         <dependency>
             <groupId>org.scala-lang.modules</groupId>
-            <artifactId>scala-collection-compat_2.12</artifactId>
+            <artifactId>scala-collection-compat_${scala.binary.version}</artifactId>
             <version>2.4.4</version>
             <scope>provided</scope>
         </dependency>
 
-        <!-- AWS SDK v2 (Ensure Consistency) -->
+        <!-- AWS SDK v2 -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>auth</artifactId>
-            <version>2.20.52</version>
+            <version>${aws.sdk.version}</version>
         </dependency>
 
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>regions</artifactId>
-            <version>2.20.52</version>
+            <version>${aws.sdk.version}</version>
         </dependency>
 
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>sts</artifactId>
-            <version>2.20.52</version>
+            <version>${aws.sdk.version}</version>
         </dependency>
 
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>dynamodb</artifactId>
-            <version>2.20.52</version>
+            <version>${aws.sdk.version}</version>
         </dependency>
 
+        <!-- Jackson is provided by Spark's runtime but declared for compilation -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.15.2</version>
+            <scope>provided</scope>
+        </dependency>
 
+        <!-- Test-only dependencies -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-engine</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
         <plugins>
-
-            <!-- Scala Maven Plugin for compiling Scala sources -->
+            <!-- Scala Maven Plugin for compiling Scala sources (kept for future Scala code) -->
             <plugin>
                 <groupId>net.alchim31.maven</groupId>
                 <artifactId>scala-maven-plugin</artifactId>
                 <version>4.5.6</version>
                 <configuration>
-                    <!-- specify the Scala version you want to use -->
-                    <scalaVersion>2.12.18</scalaVersion>
+                    <scalaVersion>${scala.version}</scalaVersion>
                 </configuration>
                 <executions>
                     <execution>
@@ -105,7 +125,7 @@
                 </executions>
             </plugin>
 
-            <!-- Maven Shade Plugin to create a fat JAR -->
+            <!-- Fat JAR containing AWS SDK dependencies so the connector is self-contained -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -117,11 +137,20 @@
                             <goal>shade</goal>
                         </goals>
                         <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
                             <transformers>
-                                <!-- Rewrite the manifest file to set the main class -->
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>dynamodb.DefaultSource</mainClass>
-                                </transformer>
+                                <!-- Preserve all ServiceLoader files (including our DataSourceRegister) -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
                         </configuration>
                     </execution>
@@ -137,9 +166,14 @@
                     <target>1.8</target>
                 </configuration>
             </plugin>
+
+            <!-- Run JUnit 5 tests -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
         </plugins>
     </build>
-
-
 
 </project>

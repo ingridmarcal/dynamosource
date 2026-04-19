@@ -5,14 +5,27 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
 import software.amazon.awssdk.services.dynamodb.paginators.QueryIterable;
+import software.amazon.awssdk.services.dynamodb.paginators.ScanIterable;
 
 import java.io.Serializable;
 import java.util.*;
 import org.apache.spark.sql.sources.Filter;
 
+/**
+ * Connects to a DynamoDB global secondary index.
+ *
+ * <p>Whenever the pushed-down filters contain an equality on the index hash
+ * key the connector issues a single {@code Query} (optionally narrowed by a
+ * range-key predicate and a {@code FilterExpression}). Otherwise it falls
+ * back to a parallel {@code Scan} over the index.
+ *
+ * <p>The legacy {@code keyconditionexpression} /
+ * {@code expressionAttributeValues} options are still honoured for
+ * backwards-compatibility; they win over anything derived from Spark filters.
+ */
 public class DynamoQueryIndexConnector extends DynamoConnector implements Serializable {
 
-    private static final long serialVersionUID = 1L; // Serializable version
+    private static final long serialVersionUID = 1L;
 
     private final boolean consistentRead;
     private final boolean filterPushdown;
@@ -27,197 +40,90 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
     private final String tableName;
     private final String indexName;
 
-    private final String keyConditionExpression;
+    private final String userKeyConditionExpression;
 
-    // Mark as transient to prevent serialization
-    private transient DynamoDbClient dynamoDbClient;
-
-    // No-arg constructor for deserialization
-    public DynamoQueryIndexConnector() {
-        super(new HashMap<>());
-        this.consistentRead = false;
-        this.filterPushdown = false;
-        this.region = "us-east-1";
-        this.roleArn = "";
-        this.providerClassName = "";
-        this.keySchema = null;
-        this.readLimit = 0;
-        this.itemLimit = 0;
-        this.totalSegments = 0;
-        this.tableName = "";
-        this.indexName = "";
-        this.keyConditionExpression = "";
-    }
-
-    public DynamoQueryIndexConnector(String tableName, String indexName, int parallelism, Map<String, String> parameters) {
+    public DynamoQueryIndexConnector(String tableName,
+                                     String indexName,
+                                     int parallelism,
+                                     Map<String, String> parameters) {
         super(parameters);
         this.tableName = tableName;
         this.indexName = indexName;
         this.consistentRead = Boolean.parseBoolean(parameters.getOrDefault("stronglyconsistentreads", "false"));
         this.filterPushdown = Boolean.parseBoolean(parameters.getOrDefault("filterpushdown", "true"));
         this.region = parameters.getOrDefault("region", "us-east-1");
-        this.roleArn = parameters.getOrDefault("roleArn", "");
+        this.roleArn = parameters.getOrDefault("rolearn", "");
         this.providerClassName = parameters.getOrDefault("providerclassname", "");
-        this.keyConditionExpression = parameters.getOrDefault("keyconditionexpression", "");
+        this.userKeyConditionExpression = parameters.getOrDefault("keyconditionexpression", "");
 
-        // Initialize DynamoDB client lazily
-        initDynamoDbClient();
+        DynamoDbClient dynamoDbClient = getDynamoDB(region, roleArn, providerClassName);
 
-        // Describe the index
         DescribeTableResponse tableDesc = dynamoDbClient.describeTable(
                 DescribeTableRequest.builder().tableName(tableName).build()
         );
 
-        GlobalSecondaryIndexDescription indexDesc = tableDesc.table().globalSecondaryIndexes()
-                .stream()
-                .filter(idx -> idx.indexName().equals(indexName))
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("Index not found: " + indexName));
+        KeySchema derived = null;
+        long indexSize = 0L;
+        long indexItemCount = 0L;
+        ProvisionedThroughputDescription indexThroughput = null;
 
-        // Extract key schema
-        this.keySchema = KeySchema.fromDescription(indexDesc.keySchema());
+        List<GlobalSecondaryIndexDescription> gsis = tableDesc.table().globalSecondaryIndexes();
+        if (gsis != null) {
+            for (GlobalSecondaryIndexDescription idx : gsis) {
+                if (idx.indexName().equals(indexName)) {
+                    derived = KeySchema.fromDescription(idx.keySchema());
+                    indexSize = idx.indexSizeBytes() == null ? 0L : idx.indexSizeBytes();
+                    indexItemCount = idx.itemCount() == null ? 0L : idx.itemCount();
+                    indexThroughput = idx.provisionedThroughput();
+                    break;
+                }
+            }
+        }
+        if (derived == null) {
+            List<LocalSecondaryIndexDescription> lsis = tableDesc.table().localSecondaryIndexes();
+            if (lsis != null) {
+                for (LocalSecondaryIndexDescription idx : lsis) {
+                    if (idx.indexName().equals(indexName)) {
+                        derived = KeySchema.fromDescription(idx.keySchema());
+                        indexSize = idx.indexSizeBytes() == null ? 0L : idx.indexSizeBytes();
+                        indexItemCount = idx.itemCount() == null ? 0L : idx.itemCount();
+                        break;
+                    }
+                }
+            }
+        }
+        if (derived == null) {
+            throw new IllegalArgumentException("Index not found on table " + tableName + ": " + indexName);
+        }
+        this.keySchema = derived;
 
-        // User parameters
         int bytesPerRCU = Integer.parseInt(parameters.getOrDefault("bytesperrcu", "4000"));
+        int maxPartitionBytes = Integer.parseInt(parameters.getOrDefault("maxpartitionbytes", "128000000"));
         double targetCapacity = Double.parseDouble(parameters.getOrDefault("targetcapacity", "1"));
         int readFactor = consistentRead ? 1 : 2;
 
-        // Index parameters
-        long indexSize = indexDesc.indexSizeBytes();
-        long itemCount = indexDesc.itemCount() > 0 ? indexDesc.itemCount() : 1; // Avoid division by zero
+        indexSize = Math.max(0L, indexSize);
+        long safeItemCount = Math.max(1L, indexItemCount);
 
-        // Provisioned or on-demand throughput
+        int numPartitions = parameters.containsKey("readpartitions")
+                ? Math.max(1, Integer.parseInt(parameters.get("readpartitions")))
+                : Math.max(1, (int) (indexSize / (long) maxPartitionBytes));
+
         long readThroughput = parameters.containsKey("throughput")
                 ? Long.parseLong(parameters.get("throughput"))
-                : (indexDesc.provisionedThroughput() != null && indexDesc.provisionedThroughput().readCapacityUnits() > 0
-                ? indexDesc.provisionedThroughput().readCapacityUnits()
-                : 100L);
+                : (indexThroughput != null && indexThroughput.readCapacityUnits() != null
+                        && indexThroughput.readCapacityUnits() > 0
+                        ? indexThroughput.readCapacityUnits()
+                        : 100L);
 
-        // Rate limit calculation
-        double avgItemSize = (double) indexSize / itemCount;
-        double rateLimit = readThroughput * targetCapacity / parallelism;
-        this.itemLimit = Math.max(1, (int) ((bytesPerRCU / avgItemSize) * rateLimit * readFactor));
+        double avgItemSize = indexSize > 0 ? ((double) indexSize) / safeItemCount : 1.0d;
+        int safeParallelism = Math.max(1, parallelism);
+        double rateLimit = Math.max(1.0d, (double) readThroughput * targetCapacity / safeParallelism);
         this.readLimit = rateLimit;
-        // Query operations cannot be reliably partitioned, so force a single segment
-        this.totalSegments = 1;
-    }
-
-    // Lazy initialization for DynamoDbClient
-    private void initDynamoDbClient() {
-        if (this.dynamoDbClient == null) {
-            this.dynamoDbClient = getDynamoDB(region, roleArn, providerClassName);
-        }
-    }
-
-    @Override
-    public boolean isFilterPushdownEnabled() {
-        return filterPushdown;
-    }
-
-    @Override
-    public boolean isQuery() {
-        return true;
-    }
-
-    @Override
-    public boolean isScan() {
-        return false;
-    }
-
-    @Override
-    public ScanResponse scan(int segmentNum, List<String> columns, Filter[] filters) {
-        initDynamoDbClient(); // Ensure client is initialized on executor
-
-        ScanRequest.Builder scanRequestBuilder = ScanRequest.builder()
-                .tableName(tableName)
-                .indexName(indexName)
-                .segment(segmentNum)
-                .totalSegments(totalSegments)
-                .limit(itemLimit)
-                .returnConsumedCapacity(ReturnConsumedCapacity.TOTAL)
-                .consistentRead(consistentRead);
-
-        Map<String, String> expressionAttributeNames = new HashMap<>();
-        Map<String, AttributeValue> expressionAttributeValues = new HashMap<>();
-
-        if (!columns.isEmpty()) {
-            List<String> projectionFields = new ArrayList<>();
-            for (String column : columns) {
-                String placeholder = "#" + column;
-                expressionAttributeNames.put(placeholder, column);
-                projectionFields.add(placeholder);
-            }
-            scanRequestBuilder.projectionExpression(String.join(", ", projectionFields));
-        }
-
-        if (filters != null && filters.length > 0 && filterPushdown) {
-            FilterPushdown.Result result = FilterPushdown.apply(filters);
-            scanRequestBuilder.filterExpression(result.getExpression());
-            expressionAttributeNames.putAll(result.getExpressionAttributeNames());
-            expressionAttributeValues.putAll(result.getExpressionAttributeValues());
-        }
-
-        if (!expressionAttributeNames.isEmpty()) {
-            scanRequestBuilder.expressionAttributeNames(expressionAttributeNames);
-        }
-        if (!expressionAttributeValues.isEmpty()) {
-            scanRequestBuilder.expressionAttributeValues(expressionAttributeValues);
-        }
-
-        return dynamoDbClient.scan(scanRequestBuilder.build());
-    }
-
-    @Override
-    public QueryIterable query(int segmentNum, List<String> columns, Filter[] filters) {
-        initDynamoDbClient(); // Ensure client is initialized on executor
-
-        if (segmentNum != 0) {
-            throw new IllegalArgumentException("Query operations do not support parallel segments; segmentNum must be 0");
-        }
-
-        Map<String, String> expressionAttributeNames = new HashMap<>();
-        Map<String, AttributeValue> expressionAttributeValues = new HashMap<>(getExpressionAttributeValues());
-
-        return dynamoDbClient.queryPaginator(queryRequest -> {
-            queryRequest
-                    .tableName(tableName)
-                    .indexName(indexName)
-                    .consistentRead(consistentRead)
-                    .limit(itemLimit);
-
-            if (keyConditionExpression != null && !keyConditionExpression.isEmpty()) {
-                queryRequest.keyConditionExpression(keyConditionExpression);
-            }
-
-            if (filterPushdown && filters != null) {
-                FilterPushdown.Result result = FilterPushdown.apply(filters);
-                queryRequest.filterExpression(result.getExpression());
-                expressionAttributeNames.putAll(result.getExpressionAttributeNames());
-                expressionAttributeValues.putAll(result.getExpressionAttributeValues());
-            }
-
-            if (!columns.isEmpty()) {
-                Map<String, String> projectionNames = new HashMap<>();
-                List<String> projectionFields = new ArrayList<>();
-
-                for (String column : columns) {
-                    String placeholder = "#" + column;
-                    projectionNames.put(placeholder, column);
-                    projectionFields.add(placeholder);
-                }
-
-                queryRequest.projectionExpression(String.join(", ", projectionFields));
-                expressionAttributeNames.putAll(projectionNames);
-            }
-
-            if (!expressionAttributeNames.isEmpty()) {
-                queryRequest.expressionAttributeNames(expressionAttributeNames);
-            }
-
-            if (!expressionAttributeValues.isEmpty()) {
-                queryRequest.expressionAttributeValues(expressionAttributeValues);
-            }
-        });
+        this.itemLimit = Math.max(1, (int) Math.min(
+                Integer.MAX_VALUE,
+                Math.floor((bytesPerRCU / Math.max(1.0d, avgItemSize)) * rateLimit * readFactor)));
+        this.totalSegments = numPartitions;
     }
 
     @Override
@@ -240,10 +146,137 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
         return this.totalSegments;
     }
 
-    // --- Private methods kept intact ---
+    @Override
+    public boolean isFilterPushdownEnabled() {
+        return this.filterPushdown;
+    }
 
-    private Map<String, AttributeValue> getExpressionAttributeValues() {
+    @Override
+    public boolean isIndex() {
+        return true;
+    }
+
+    @Override
+    public boolean canQueryWithFilters(Filter[] filters) {
+        if (userKeyConditionExpression != null && !userKeyConditionExpression.isEmpty()) {
+            return true;
+        }
+        if (!filterPushdown || filters == null || filters.length == 0) {
+            return false;
+        }
+        return FilterPushdown.extractKeyCondition(filters, keySchema).hasKeyCondition();
+    }
+
+    @Override
+    public Iterator<Map<String, AttributeValue>> readItems(int segmentNum, List<String> columns, Filter[] filters) {
+        DynamoDbClient client = getDynamoDB(region, roleArn, providerClassName);
+
+        if (canQueryWithFilters(filters)) {
+            return runQuery(client, columns, filters);
+        }
+        return runScan(client, segmentNum, columns, filters);
+    }
+
+    private Iterator<Map<String, AttributeValue>> runScan(DynamoDbClient client,
+                                                          int segmentNum,
+                                                          List<String> columns,
+                                                          Filter[] filters) {
+        ScanRequest.Builder builder = ScanRequest.builder()
+                .tableName(tableName)
+                .indexName(indexName)
+                .segment(segmentNum)
+                .totalSegments(totalSegments)
+                .limit(itemLimit)
+                .returnConsumedCapacity(ReturnConsumedCapacity.TOTAL)
+                .consistentRead(consistentRead);
+
+        Map<String, String> names = new HashMap<>();
+        Map<String, AttributeValue> values = new HashMap<>();
+
+        ProjectionExpression projection = ProjectionExpression.of(columns);
+        if (projection.expression != null) {
+            builder.projectionExpression(projection.expression);
+            names.putAll(projection.names);
+        }
+
+        if (filters != null && filterPushdown && filters.length > 0) {
+            FilterPushdown.Result result = FilterPushdown.apply(filters);
+            if (result.getExpression() != null && !result.getExpression().isEmpty()) {
+                builder.filterExpression(result.getExpression());
+                names.putAll(result.getExpressionAttributeNames());
+                values.putAll(result.getExpressionAttributeValues());
+            }
+        }
+
+        if (!names.isEmpty()) builder.expressionAttributeNames(names);
+        if (!values.isEmpty()) builder.expressionAttributeValues(values);
+
+        ScanIterable paginator = client.scanPaginator(builder.build());
+        return Iterators.flatten(paginator.iterator(), ScanResponse::items);
+    }
+
+    private Iterator<Map<String, AttributeValue>> runQuery(DynamoDbClient client,
+                                                           List<String> columns,
+                                                           Filter[] filters) {
+        Map<String, String> names = new HashMap<>();
+        Map<String, AttributeValue> values = new HashMap<>();
+
+        String keyConditionExpression;
+        String filterExpression = null;
+
+        if (userKeyConditionExpression != null && !userKeyConditionExpression.isEmpty()) {
+            keyConditionExpression = userKeyConditionExpression;
+            values.putAll(getUserExpressionAttributeValues());
+            // When the user provides a raw expression, still try to push non-key filters
+            // through a FilterExpression using the automatic translation.
+            if (filters != null && filterPushdown && filters.length > 0) {
+                FilterPushdown.Result result = FilterPushdown.apply(filters);
+                if (result.getExpression() != null && !result.getExpression().isEmpty()) {
+                    filterExpression = result.getExpression();
+                    names.putAll(result.getExpressionAttributeNames());
+                    values.putAll(result.getExpressionAttributeValues());
+                }
+            }
+        } else {
+            FilterPushdown.KeyConditionResult pushed = FilterPushdown.extractKeyCondition(filters, keySchema);
+            keyConditionExpression = pushed.getKeyConditionExpression();
+            filterExpression = pushed.getFilterExpression();
+            names.putAll(pushed.getExpressionAttributeNames());
+            values.putAll(pushed.getExpressionAttributeValues());
+        }
+
+        QueryRequest.Builder builder = QueryRequest.builder()
+                .tableName(tableName)
+                .indexName(indexName)
+                .keyConditionExpression(keyConditionExpression)
+                .limit(itemLimit)
+                .returnConsumedCapacity(ReturnConsumedCapacity.TOTAL)
+                .consistentRead(consistentRead);
+
+        if (filterExpression != null) {
+            builder.filterExpression(filterExpression);
+        }
+
+        ProjectionExpression projection = ProjectionExpression.of(columns);
+        if (projection.expression != null) {
+            builder.projectionExpression(projection.expression);
+            names.putAll(projection.names);
+        }
+
+        if (!names.isEmpty()) builder.expressionAttributeNames(names);
+        if (!values.isEmpty()) builder.expressionAttributeValues(values);
+
+        QueryIterable paginator = client.queryPaginator(builder.build());
+        return Iterators.flatten(paginator.iterator(), QueryResponse::items);
+    }
+
+    // --- User-supplied expressionAttributeValues parsing kept for backward compat ---
+
+    private Map<String, AttributeValue> getUserExpressionAttributeValues() {
         String jsonString = properties.get("expressionAttributeValues");
+        if (jsonString == null) {
+            jsonString = properties.get("expressionattributevalues");
+        }
         if (jsonString == null || jsonString.isEmpty()) {
             return Collections.emptyMap();
         }
@@ -259,10 +292,7 @@ public class DynamoQueryIndexConnector extends DynamoConnector implements Serial
 
             for (Iterator<Map.Entry<String, JsonNode>> it = rootNode.fields(); it.hasNext(); ) {
                 Map.Entry<String, JsonNode> entry = it.next();
-                String key = entry.getKey();
-                JsonNode valueNode = entry.getValue();
-
-                parsedValues.put(key, parseAttributeValue(valueNode));
+                parsedValues.put(entry.getKey(), parseAttributeValue(entry.getValue()));
             }
 
             return parsedValues;
